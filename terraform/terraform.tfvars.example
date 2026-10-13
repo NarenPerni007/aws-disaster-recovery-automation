@@ -1,0 +1,20 @@
+# Copy this file to terraform.tfvars and fill in real values. Never commit
+# terraform.tfvars: it holds secrets and account-specific settings.
+
+project       = "app"
+environment   = "prod"
+primary_region = "us-east-1"
+dr_region      = "us-west-2"
+
+db_password = "CHANGE_ME"
+
+hosted_zone_name     = "example.com"
+app_domain           = "app.example.com"
+app_primary_endpoint = "app.example.com"
+app_primary_ip       = "203.0.113.10"
+app_dr_ip            = "203.0.113.20"
+
+alert_email = "dr-alerts@example.com"
+
+# ARNs of the people or roles allowed to assume the DR operator role.
+dr_operator_principals = []
