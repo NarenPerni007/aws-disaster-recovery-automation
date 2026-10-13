@@ -1,0 +1,39 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfstate.*
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# Terraform variables with real values (never commit these)
+*.tfvars
+!terraform.tfvars.example
+
+# Ansible
+*.retry
+ansible/inventory/host_vars/
+ansible/inventory/group_vars/*.vault
+*.vault
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editor and OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Local notes and drill evidence stay out of the repo unless scrubbed
+/tmp/
