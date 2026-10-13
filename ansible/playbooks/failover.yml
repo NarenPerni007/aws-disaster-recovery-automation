@@ -1,0 +1,122 @@
+---
+# Failover: promote the DR read replica and point DNS at the DR region.
+#
+# What this automates: replica promotion, the DNS change, and health checks.
+# What stays manual: the decision to fail over (a human types YES below),
+# stakeholder communication, application-level verification such as logging
+# in and running a smoke test, and the incident record. Failover is a
+# business decision, not a script outcome.
+#
+# Required variables (pass with -e):
+#   dr_replica_id, dr_region, hosted_zone_id, app_domain, app_dr_ip,
+#   primary_health_url, app_health_url
+# Example:
+#   ansible-playbook playbooks/failover.yml -e dr_replica_id=app-dr-replica \
+#     -e dr_region=us-west-2 -e hosted_zone_id=Z0123456789ABC \
+#     -e app_domain=app.example.com -e app_dr_ip=203.0.113.20 \
+#     -e primary_health_url=https://app.example.com/health \
+#     -e app_health_url=https://app.example.com/health
+
+- name: Fail over to the DR region
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_prompt:
+    - name: confirm_failover
+      prompt: "Type YES to confirm failover to the DR region"
+      private: false
+
+  tasks:
+    - name: Abort unless failover was confirmed
+      ansible.builtin.assert:
+        that:
+          - confirm_failover == "YES"
+        fail_msg: "Failover not confirmed. Aborting."
+
+    - name: Check whether the primary endpoint is still answering
+      ansible.builtin.uri:
+        url: "{{ primary_health_url }}"
+        method: GET
+        status_code: 200
+        timeout: 10
+      ignore_errors: true
+      register: primary_health
+
+    - name: Show the primary health check result
+      ansible.builtin.debug:
+        msg: "Primary health check status: {{ primary_health.status | default('unreachable') }}. Proceeding with failover."
+
+    - name: Pause so the operator can reconsider before promotion
+      ansible.builtin.pause:
+        prompt: "Promotion is one-way. Press Enter to promote the DR replica, or Ctrl+C to abort"
+
+    - name: Promote the DR read replica to a standalone primary
+      ansible.builtin.command:
+        cmd: >-
+          aws rds promote-read-replica
+          --db-instance-identifier {{ dr_replica_id }}
+          --region {{ dr_region }}
+      changed_when: true
+
+    - name: Wait until the promoted database is available
+      ansible.builtin.command:
+        cmd: >-
+          aws rds describe-db-instances
+          --db-instance-identifier {{ dr_replica_id }}
+          --region {{ dr_region }}
+          --query "DBInstances[0].DBInstanceStatus"
+          --output text
+      register: db_status
+      until: db_status.stdout == "available"
+      retries: 60
+      delay: 30
+      changed_when: false
+
+    - name: Write the Route 53 change batch for the DR record
+      ansible.builtin.copy:
+        dest: /tmp/dr-failover-change-batch.json
+        mode: "0600"
+        content: |
+          {
+            "Changes": [
+              {
+                "Action": "UPSERT",
+                "ResourceRecordSet": {
+                  "Name": "{{ app_domain }}",
+                  "Type": "A",
+                  "TTL": 60,
+                  "SetIdentifier": "secondary",
+                  "Failover": "SECONDARY",
+                  "ResourceRecords": [{ "Value": "{{ app_dr_ip }}" }]
+                }
+              }
+            ]
+          }
+
+    - name: Point DNS at the DR region
+      ansible.builtin.command:
+        cmd: >-
+          aws route53 change-resource-record-sets
+          --hosted-zone-id {{ hosted_zone_id }}
+          --change-batch file:///tmp/dr-failover-change-batch.json
+      changed_when: true
+
+    - name: Wait for the application to answer from the DR region
+      ansible.builtin.uri:
+        url: "{{ app_health_url }}"
+        method: GET
+        status_code: 200
+        timeout: 10
+      register: dr_health
+      until: dr_health.status == 200
+      retries: 30
+      delay: 20
+
+    - name: Summarize the failover
+      ansible.builtin.debug:
+        msg: >-
+          Failover complete. Replica {{ dr_replica_id }} is promoted and DNS
+          points at the DR region. Still manual: notify stakeholders, run the
+          application smoke test, open the incident record, and start the
+          failback plan when the primary region is healthy again.

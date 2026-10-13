@@ -1,0 +1,111 @@
+---
+# Failback: return traffic to the primary region after an outage.
+#
+# What this automates: building a new replica from the promoted database,
+# flipping DNS back, and health checks.
+# What stays manual: the decision to fail back (a human types YES below),
+# confirming the primary region is genuinely healthy, reconciling any data
+# written in DR that never made it back, stakeholder communication, and
+# decommissioning the old resources. Failback is planned, never rushed.
+#
+# Required variables (pass with -e):
+#   promoted_db_id, new_replica_id, primary_region, hosted_zone_id,
+#   app_domain, app_primary_ip, primary_health_url
+# Example:
+#   ansible-playbook playbooks/failback.yml -e promoted_db_id=app-dr-replica \
+#     -e new_replica_id=app-primary-replica -e primary_region=us-east-1 \
+#     -e hosted_zone_id=Z0123456789ABC -e app_domain=app.example.com \
+#     -e app_primary_ip=203.0.113.10 \
+#     -e primary_health_url=https://app.example.com/health
+
+- name: Fail back to the primary region
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_prompt:
+    - name: confirm_failback
+      prompt: "Type YES to confirm failback to the primary region"
+      private: false
+
+  tasks:
+    - name: Abort unless failback was confirmed
+      ansible.builtin.assert:
+        that:
+          - confirm_failback == "YES"
+        fail_msg: "Failback not confirmed. Aborting."
+
+    - name: Pause so the operator can confirm the primary region is healthy
+      ansible.builtin.pause:
+        prompt: "Confirm the primary region is healthy and data is reconciled. Press Enter to continue, or Ctrl+C to abort"
+
+    - name: Create a new read replica from the promoted database
+      ansible.builtin.command:
+        cmd: >-
+          aws rds create-db-instance-read-replica
+          --db-instance-identifier {{ new_replica_id }}
+          --source-db-instance-identifier {{ promoted_db_id }}
+          --region {{ primary_region }}
+      changed_when: true
+
+    - name: Wait until the new replica is available
+      ansible.builtin.command:
+        cmd: >-
+          aws rds describe-db-instances
+          --db-instance-identifier {{ new_replica_id }}
+          --region {{ primary_region }}
+          --query "DBInstances[0].DBInstanceStatus"
+          --output text
+      register: db_status
+      until: db_status.stdout == "available"
+      retries: 60
+      delay: 30
+      changed_when: false
+
+    - name: Write the Route 53 change batch for the primary record
+      ansible.builtin.copy:
+        dest: /tmp/dr-failback-change-batch.json
+        mode: "0600"
+        content: |
+          {
+            "Changes": [
+              {
+                "Action": "UPSERT",
+                "ResourceRecordSet": {
+                  "Name": "{{ app_domain }}",
+                  "Type": "A",
+                  "TTL": 60,
+                  "SetIdentifier": "primary",
+                  "Failover": "PRIMARY",
+                  "ResourceRecords": [{ "Value": "{{ app_primary_ip }}" }]
+                }
+              }
+            ]
+          }
+
+    - name: Point DNS back at the primary region
+      ansible.builtin.command:
+        cmd: >-
+          aws route53 change-resource-record-sets
+          --hosted-zone-id {{ hosted_zone_id }}
+          --change-batch file:///tmp/dr-failback-change-batch.json
+      changed_when: true
+
+    - name: Wait for the application to answer from the primary region
+      ansible.builtin.uri:
+        url: "{{ primary_health_url }}"
+        method: GET
+        status_code: 200
+        timeout: 10
+      register: primary_health
+      until: primary_health.status == 200
+      retries: 30
+      delay: 20
+
+    - name: Summarize the failback
+      ansible.builtin.debug:
+        msg: >-
+          Failback complete. Traffic is back in the primary region and a new
+          replica {{ new_replica_id }} is running. Still manual: verify the
+          application end to end, decommission the old DR resources per the
+          failback runbook, and re-establish the original replication setup.

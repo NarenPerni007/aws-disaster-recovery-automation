@@ -1,0 +1,91 @@
+---
+# Backup verification: confirm recent backups actually succeeded, and
+# optionally run a restore test into an isolated sandbox.
+#
+# What this automates: listing recent backup jobs, failing when no recent
+# successful backup exists, and an optional restore test.
+# What stays manual: deciding whether the restored data is correct (a human
+# checks it), and cleaning up the sandbox if the playbook is interrupted.
+# A backup nobody has restored is a hope, not a recovery plan.
+#
+# Required variables (pass with -e):
+#   backup_vault_name
+# Optional variables:
+#   run_restore_test (true/false, default false)
+#   restore_recovery_point_arn (required when run_restore_test is true)
+#   restore_iam_role_arn (required when run_restore_test is true)
+# Example:
+#   ansible-playbook playbooks/verify-backups.yml \
+#     -e backup_vault_name=app-primary-vault
+
+- name: Verify backups and optionally test a restore
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    run_restore_test: false
+
+  tasks:
+    - name: List the most recent completed backup jobs
+      ansible.builtin.command:
+        cmd: >-
+          aws backup list-backup-jobs
+          --by-backup-vault-name {{ backup_vault_name }}
+          --by-state COMPLETED
+          --max-results 5
+          --output json
+      register: completed_jobs
+      changed_when: false
+
+    - name: Parse the completed jobs
+      ansible.builtin.set_fact:
+        completed_list: "{{ (completed_jobs.stdout | from_json).BackupJobs | default([]) }}"
+
+    - name: Fail when no completed backup exists
+      ansible.builtin.assert:
+        that:
+          - completed_list | length > 0
+        fail_msg: "No completed backup jobs found in vault {{ backup_vault_name }}. Investigate before anything else."
+
+    - name: Show the latest successful backup
+      ansible.builtin.debug:
+        msg: "Latest successful backup: {{ completed_list[0].BackupJobId }} completed at {{ completed_list[0].CompletionDate }} for {{ completed_list[0].ResourceArn }}."
+
+    - name: List failed backup jobs
+      ansible.builtin.command:
+        cmd: >-
+          aws backup list-backup-jobs
+          --by-backup-vault-name {{ backup_vault_name }}
+          --by-state FAILED
+          --max-results 5
+          --output json
+      register: failed_jobs
+      changed_when: false
+
+    - name: Warn about failed backup jobs
+      ansible.builtin.debug:
+        msg: "Warning: {{ (failed_jobs.stdout | from_json).BackupJobs | length }} failed backup job(s) found. Review them before the next drill."
+      when: (failed_jobs.stdout | from_json).BackupJobs | length > 0
+
+    - name: Pause before the restore test
+      ansible.builtin.pause:
+        prompt: "Restore test will create real resources in a sandbox. Press Enter to continue, or Ctrl+C to skip it"
+      when: run_restore_test | bool
+
+    - name: Start a restore test into the sandbox
+      ansible.builtin.command:
+        cmd: >-
+          aws backup start-restore-job
+          --recovery-point-arn {{ restore_recovery_point_arn }}
+          --iam-role-arn {{ restore_iam_role_arn }}
+          --metadata '{"id":"sandbox-restore-test"}'
+          --output json
+      register: restore_job
+      changed_when: true
+      when: run_restore_test | bool
+
+    - name: Show the restore job id
+      ansible.builtin.debug:
+        msg: "Restore test started: {{ (restore_job.stdout | from_json).RestoreJobId }}. Verify the restored data by hand, then clean up the sandbox resources."
+      when: run_restore_test | bool
