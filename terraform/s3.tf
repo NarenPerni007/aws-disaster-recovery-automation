@@ -28,6 +28,18 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "primary" {
   }
 }
 
+# Nothing in this setup is ever public. Block public access explicitly on
+# both buckets instead of relying on account level defaults, so a policy
+# or ACL mistake on the DR copies cannot expose replicated data.
+resource "aws_s3_bucket_public_access_block" "primary" {
+  bucket = aws_s3_bucket.primary.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
 resource "aws_s3_bucket" "dr" {
   provider = aws.dr
   bucket   = "${var.project}-${var.environment}-dr-data"
@@ -55,6 +67,16 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "dr" {
       sse_algorithm = "AES256"
     }
   }
+}
+
+resource "aws_s3_bucket_public_access_block" "dr" {
+  provider = aws.dr
+  bucket   = aws_s3_bucket.dr.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
 }
 
 resource "aws_s3_bucket_replication_configuration" "primary" {
